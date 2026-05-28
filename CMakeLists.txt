@@ -17,6 +17,9 @@ if (VTK_VERSION VERSION_LESS "8.90.0")
 endif()
 
 add_executable(mid_surface_mapper mid_surface_mapper.cpp)
+if(MSVC)
+  target_compile_options(mid_surface_mapper PRIVATE "/utf-8")
+endif()
 target_link_libraries(mid_surface_mapper PRIVATE ${VTK_LIBRARIES})
 target_compile_definitions(mid_surface_mapper PRIVATE MID_SURFACE_MAPPER_BUILD_CLI)
 

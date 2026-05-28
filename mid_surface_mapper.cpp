@@ -5,6 +5,7 @@
 #include <vtkCellData.h>
 #include <vtkDataArray.h>
 #include <vtkDataSet.h>
+#include <vtkDataSetReader.h>
 #include <vtkIdList.h>
 #include <vtkIntArray.h>
 #include <vtkMath.h>
@@ -12,7 +13,6 @@
 #include <vtkPointData.h>
 #include <vtkPoints.h>
 #include <vtkPolyData.h>
-#include <vtkPolyDataReader.h>
 #include <vtkPolyDataWriter.h>
 #include <vtkSmartPointer.h>
 #include <vtkUnstructuredGrid.h>
@@ -270,9 +270,10 @@ vtkDataArray* FindFaceIdArray(vtkPolyData* surface) {
   }
 
   // 优先找常见名字；如果用户文件里名字不同，则退化为第一个单分量 CellData。
-  const std::array<std::string, 8> preferredNames = {
+  const std::array<std::string, 10> preferredNames = {
       "face_id", "faceid", "FaceID", "FaceId",
-      "surface_id", "surfaceid", "SurfaceID", "id"};
+      "surface_id", "surfaceid", "SurfaceID",
+      "regions", "region", "id"};
 
   for (const auto& preferred : preferredNames) {
     for (int i = 0; i < cellData->GetNumberOfArrays(); ++i) {
@@ -837,13 +838,27 @@ double ComputeDefaultTolerance(vtkPolyData* surface,
   return std::max(diagonal * 1e-8, 1e-9);
 }
 
-vtkSmartPointer<vtkPolyData> ReadPolyData(const std::string& path) {
-  vtkNew<vtkPolyDataReader> reader;
+vtkSmartPointer<vtkDataSet> ReadDataSet(const std::string& path) {
+  vtkNew<vtkDataSetReader> reader;
   reader->SetFileName(path.c_str());
   reader->Update();
 
-  vtkSmartPointer<vtkPolyData> data = vtkSmartPointer<vtkPolyData>::New();
-  data->DeepCopy(reader->GetOutput());
+  vtkDataSet* output = reader->GetOutput();
+  if (!output) {
+    return nullptr;
+  }
+
+  vtkSmartPointer<vtkDataSet> data;
+  if (auto* polyData = vtkPolyData::SafeDownCast(output)) {
+    vtkSmartPointer<vtkPolyData> copy = vtkSmartPointer<vtkPolyData>::New();
+    copy->DeepCopy(polyData);
+    data = copy;
+  } else if (auto* grid = vtkUnstructuredGrid::SafeDownCast(output)) {
+    vtkSmartPointer<vtkUnstructuredGrid> copy =
+        vtkSmartPointer<vtkUnstructuredGrid>::New();
+    copy->DeepCopy(grid);
+    data = copy;
+  }
   return data;
 }
 
@@ -856,6 +871,72 @@ vtkSmartPointer<vtkUnstructuredGrid> ReadUnstructuredGrid(const std::string& pat
       vtkSmartPointer<vtkUnstructuredGrid>::New();
   data->DeepCopy(reader->GetOutput());
   return data;
+}
+
+vtkSmartPointer<vtkPolyData> ExtractFaceCells(vtkDataSet* input,
+                                              bool allowQuads,
+                                              const std::string& roleName) {
+  if (!input || input->GetNumberOfPoints() == 0) {
+    return nullptr;
+  }
+  if (auto* polyData = vtkPolyData::SafeDownCast(input)) {
+    vtkSmartPointer<vtkPolyData> copy = vtkSmartPointer<vtkPolyData>::New();
+    copy->DeepCopy(polyData);
+    return copy;
+  }
+
+  vtkNew<vtkPolyData> output;
+  vtkNew<vtkPoints> points;
+  points->SetDataTypeToDouble();
+  points->SetNumberOfPoints(input->GetNumberOfPoints());
+  for (vtkIdType pointId = 0; pointId < input->GetNumberOfPoints(); ++pointId) {
+    double point[3];
+    input->GetPoint(pointId, point);
+    points->SetPoint(pointId, point);
+  }
+  output->SetPoints(points);
+  output->GetPointData()->ShallowCopy(input->GetPointData());
+
+  vtkNew<vtkCellArray> polys;
+  output->GetCellData()->CopyAllocate(input->GetCellData());
+
+  vtkIdType copiedCells = 0;
+  vtkIdType skippedCells = 0;
+  for (vtkIdType cellId = 0; cellId < input->GetNumberOfCells(); ++cellId) {
+    vtkCell* cell = input->GetCell(cellId);
+    if (!cell) {
+      ++skippedCells;
+      continue;
+    }
+
+    const vtkIdType numberOfPoints = cell->GetNumberOfPoints();
+    if (numberOfPoints != 3 && !(allowQuads && numberOfPoints == 4)) {
+      ++skippedCells;
+      continue;
+    }
+
+    vtkNew<vtkIdList> ids;
+    ids->SetNumberOfIds(numberOfPoints);
+    for (vtkIdType i = 0; i < numberOfPoints; ++i) {
+      ids->SetId(i, cell->GetPointId(i));
+    }
+
+    const vtkIdType newCellId = polys->InsertNextCell(ids);
+    output->GetCellData()->CopyData(input->GetCellData(), cellId, newCellId);
+    ++copiedCells;
+  }
+
+  output->SetPolys(polys);
+  if (skippedCells > 0) {
+    std::cerr << "Skipped " << skippedCells << " non-face cells while reading "
+              << roleName << ".\n";
+  }
+  if (copiedCells == 0) {
+    std::cerr << "No triangle" << (allowQuads ? "/quad" : "")
+              << " cells found in " << roleName << ".\n";
+    return nullptr;
+  }
+  return output;
 }
 
 bool WritePolyData(vtkPolyData* data, const std::string& path) {
@@ -875,9 +956,13 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
                       double tolerance,
                       double projectionThreshold) {
   // 入口函数：读入三个 VTK 文件，输出全三角形且带 surface_id 的中面网格。
-  vtkSmartPointer<vtkPolyData> surface = ReadPolyData(surfaceMeshPath);
+  vtkSmartPointer<vtkDataSet> surfaceDataSet = ReadDataSet(surfaceMeshPath);
   vtkSmartPointer<vtkUnstructuredGrid> volume = ReadUnstructuredGrid(volumeMeshPath);
-  vtkSmartPointer<vtkPolyData> midSurface = ReadPolyData(midSurfacePath);
+  vtkSmartPointer<vtkDataSet> midSurfaceDataSet = ReadDataSet(midSurfacePath);
+  vtkSmartPointer<vtkPolyData> surface =
+      ExtractFaceCells(surfaceDataSet, false, "surface mesh");
+  vtkSmartPointer<vtkPolyData> midSurface =
+      ExtractFaceCells(midSurfaceDataSet, true, "mid-surface mesh");
 
   if (!surface || surface->GetNumberOfPoints() == 0 || surface->GetNumberOfCells() == 0) {
     std::cerr << "Failed to read a non-empty surface mesh: " << surfaceMeshPath << "\n";
@@ -981,6 +1066,7 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
 
   vtkNew<vtkPolyData> output;
   vtkNew<vtkPoints> points;
+  points->SetDataTypeToDouble();
   points->DeepCopy(midSurface->GetPoints());
   output->SetPoints(points);
   output->GetPointData()->ShallowCopy(midSurface->GetPointData());
