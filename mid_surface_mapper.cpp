@@ -86,6 +86,10 @@ double TriangleArea(const Vec3& a, const Vec3& b, const Vec3& c) {
   return 0.5 * Norm(Cross(b - a, c - a));
 }
 
+double Clamp(double value, double low, double high) {
+  return std::max(low, std::min(value, high));
+}
+
 Vec3 GetPoint(vtkPoints* points, vtkIdType id) {
   double p[3];
   points->GetPoint(id, p);
@@ -249,6 +253,11 @@ struct SurfaceTriangle {
   double bounds[6]{};
 };
 
+struct SurfaceFaceMatch {
+  int faceId = kUnmatchedFaceId;
+  Vec3 normal{};
+};
+
 bool IsNameMatch(const std::string& name, const std::string& expected) {
   std::string lhs = name;
   std::string rhs = expected;
@@ -333,6 +342,142 @@ bool PointInTriangle(const Vec3& p,
   return inside;
 }
 
+struct Vec2 {
+  double x = 0.0;
+  double y = 0.0;
+};
+
+Vec2 operator+(const Vec2& a, const Vec2& b) {
+  return {a.x + b.x, a.y + b.y};
+}
+
+Vec2 operator-(const Vec2& a, const Vec2& b) {
+  return {a.x - b.x, a.y - b.y};
+}
+
+Vec2 operator*(const Vec2& a, double s) {
+  return {a.x * s, a.y * s};
+}
+
+double Cross2D(const Vec2& a, const Vec2& b) {
+  return a.x * b.y - a.y * b.x;
+}
+
+double PolygonArea2D(const std::vector<Vec2>& polygon) {
+  if (polygon.size() < 3) {
+    return 0.0;
+  }
+
+  double signedArea = 0.0;
+  for (int i = 0; i < static_cast<int>(polygon.size()); ++i) {
+    const Vec2& a = polygon[i];
+    const Vec2& b = polygon[(i + 1) % polygon.size()];
+    signedArea += Cross2D(a, b);
+  }
+  return 0.5 * std::abs(signedArea);
+}
+
+std::vector<Vec2> ClipPolygonByHalfPlane(const std::vector<Vec2>& polygon,
+                                         const Vec2& clipA,
+                                         const Vec2& clipB,
+                                         double orientation,
+                                         double tolerance) {
+  std::vector<Vec2> clipped;
+  if (polygon.empty()) {
+    return clipped;
+  }
+
+  const Vec2 edge = clipB - clipA;
+  const auto signedInside = [&](const Vec2& point) {
+    return orientation * Cross2D(edge, point - clipA);
+  };
+  const auto inside = [&](const Vec2& point) {
+    return signedInside(point) >= -tolerance;
+  };
+
+  Vec2 previous = polygon.back();
+  bool previousInside = inside(previous);
+  for (const Vec2& current : polygon) {
+    const bool currentInside = inside(current);
+    if (currentInside != previousInside) {
+      const Vec2 segment = current - previous;
+      const double previousDistance = signedInside(previous);
+      const double currentDistance = signedInside(current);
+      const double denom = previousDistance - currentDistance;
+      if (std::abs(denom) > tolerance) {
+        const double t = previousDistance / denom;
+        clipped.push_back(previous + segment * t);
+      }
+    }
+    if (currentInside) {
+      clipped.push_back(current);
+    }
+    previous = current;
+    previousInside = currentInside;
+  }
+  return clipped;
+}
+
+double ClippedProjectionAreaRatio(const std::array<Vec3, 3>& sourceTriangle,
+                                  const SurfaceTriangle& targetTriangle,
+                                  double sourceArea,
+                                  double tolerance) {
+  if (sourceArea <= tolerance * tolerance ||
+      targetTriangle.area <= tolerance * tolerance) {
+    return 0.0;
+  }
+
+  const Vec3 origin = targetTriangle.points[0];
+  const Vec3 axisU = Normalize(targetTriangle.points[1] - origin);
+  Vec3 axisV = Cross(targetTriangle.normal, axisU);
+  axisV = Normalize(axisV);
+  if (Norm(axisU) <= tolerance || Norm(axisV) <= tolerance) {
+    return 0.0;
+  }
+
+  const auto toPlane2D = [&](const Vec3& point) {
+    const Vec3 projected =
+        point - targetTriangle.normal * Dot(point - origin, targetTriangle.normal);
+    const Vec3 local = projected - origin;
+    return Vec2{Dot(local, axisU), Dot(local, axisV)};
+  };
+
+  std::vector<Vec2> projected = {
+      toPlane2D(sourceTriangle[0]),
+      toPlane2D(sourceTriangle[1]),
+      toPlane2D(sourceTriangle[2])};
+  std::array<Vec2, 3> target = {
+      toPlane2D(targetTriangle.points[0]),
+      toPlane2D(targetTriangle.points[1]),
+      toPlane2D(targetTriangle.points[2])};
+
+  double targetOrientation =
+      Cross2D(target[1] - target[0], target[2] - target[0]);
+  if (std::abs(targetOrientation) <= tolerance * tolerance) {
+    return 0.0;
+  }
+  targetOrientation = targetOrientation > 0.0 ? 1.0 : -1.0;
+
+  std::vector<Vec2> clipped = projected;
+  for (int i = 0; i < 3; ++i) {
+    clipped = ClipPolygonByHalfPlane(
+        clipped, target[i], target[(i + 1) % 3], targetOrientation, tolerance);
+    if (clipped.empty()) {
+      return 0.0;
+    }
+  }
+
+  const double clippedArea = PolygonArea2D(clipped);
+  return Clamp(clippedArea / sourceArea, 0.0, 1.0);
+}
+
+double DihedralCompatibility(const Vec3& referenceNormal,
+                             const Vec3& candidateNormal) {
+  const double dot = Clamp(std::abs(Dot(referenceNormal, candidateNormal)), 0.0, 1.0);
+  const double angle = std::acos(dot);
+  return 1.0 - angle / (0.5 * vtkMath::Pi());
+}
+
 class SurfaceIndex {
  public:
   SurfaceIndex(vtkPolyData* surface, double tolerance)
@@ -394,6 +539,7 @@ class SurfaceIndex {
       }
       // 三个顶点组成的三角形 -> surface 三角形：用于快速查“三点侧”的 Face ID。
       triangleToSurface_[MakeTriangleKey(tri.pointKeys)].push_back(index);
+      faceIdToTriangles_[tri.faceId].push_back(index);
       triangles_.push_back(tri);
     }
 
@@ -412,22 +558,26 @@ class SurfaceIndex {
     return true;
   }
 
-  int FindFaceIdForSurfaceTriangle(const std::array<Vec3, 3>& points) const {
+  SurfaceFaceMatch FindSurfaceTriangleMatch(
+      const std::array<Vec3, 3>& points) const {
     std::array<QuantKey, 3> keys = {
         quantize_(points[0]), quantize_(points[1]), quantize_(points[2])};
     const auto it = triangleToSurface_.find(MakeTriangleKey(keys));
     if (it != triangleToSurface_.end() && !it->second.empty()) {
-      return triangles_[it->second.front()].faceId;
+      const SurfaceTriangle& tri = triangles_[it->second.front()];
+      return {tri.faceId, tri.normal};
     }
 
     // 如果三点刚好因为编号/容差没完全命中，就用重心做一次点落面兜底。
     const Vec3 centroid = (points[0] + points[1] + points[2]) * (1.0 / 3.0);
-    return FindFaceIdForPoint(centroid, nullptr, 0.70);
+    return {FindFaceIdForPoint(centroid, nullptr, 0.70, nullptr, 0.0), {}};
   }
 
   int FindFaceIdForPoint(const Vec3& point,
                          const std::array<Vec3, 3>* midTriangle,
-                         double projectionThreshold) const {
+                         double projectionThreshold,
+                         const Vec3* preferredParallelNormal,
+                         double dihedralWeight) const {
     // 先通过量化后的点坐标查候选 surface 三角形；没找到再扫包围盒兜底。
     std::vector<int> candidates = CandidateTrianglesForPoint(point);
     if (candidates.empty()) {
@@ -435,6 +585,7 @@ class SurfaceIndex {
     }
 
     std::map<int, double> faceToProjectionRatio;
+    std::map<int, double> faceToDihedralCompatibility;
     std::map<int, int> faceCounts;
     Vec3 midNormal{};
     double midArea = 0.0;
@@ -453,11 +604,17 @@ class SurfaceIndex {
       }
       ++faceCounts[tri.faceId];
       if (midArea > tolerance_ * tolerance_) {
-        // 中面三角形投影到候选面的面积比例 = |n_mid dot n_surface|。
-        // 因为投影面积 = 原面积 * cos(theta)，这里法向都已归一化。
-        const double ratio = std::abs(Dot(midNormal, tri.normal));
+        // 投影面积必须裁剪到候选 surface 三角形内部，面外部分不计入比例。
+        const double ratio =
+            ClippedProjectionAreaRatio(*midTriangle, tri, midArea, tolerance_);
         auto& bestRatio = faceToProjectionRatio[tri.faceId];
         bestRatio = std::max(bestRatio, ratio);
+      }
+      if (preferredParallelNormal) {
+        auto& bestCompatibility = faceToDihedralCompatibility[tri.faceId];
+        bestCompatibility = std::max(
+            bestCompatibility,
+            DihedralCompatibility(*preferredParallelNormal, tri.normal));
       }
     }
 
@@ -468,14 +625,31 @@ class SurfaceIndex {
       // 点只落在一个 Face ID 上：属于“点在面内部”的情况，直接使用该 Face ID。
       return faceCounts.begin()->first;
     }
-    if (!midTriangle || faceToProjectionRatio.empty()) {
+    if (!midTriangle || midArea <= tolerance_ * tolerance_) {
       return kUnmatchedFaceId;
     }
 
+    // 投影面积按整个 Face ID 区域累计，而不是只取包含边界点的单个三角形。
+    for (const auto& [faceId, count] : faceCounts) {
+      faceToProjectionRatio[faceId] =
+          ClippedProjectionAreaRatioForFaceId(*midTriangle, midArea, faceId);
+    }
+
     int bestFaceId = kUnmatchedFaceId;
+    double bestScore = -1.0;
     double bestRatio = -1.0;
+    dihedralWeight = Clamp(dihedralWeight, 0.0, 1.0);
+    const double projectionWeight = 1.0 - dihedralWeight;
     for (const auto& [faceId, ratio] : faceToProjectionRatio) {
-      if (ratio > bestRatio) {
+      const auto dihedralIt = faceToDihedralCompatibility.find(faceId);
+      const double dihedralScore =
+          dihedralIt == faceToDihedralCompatibility.end() ? 1.0 : dihedralIt->second;
+      // 组合评分：投影面积比越大越好，二面角越小越好。
+      // dihedralScore = 1 表示两面平行/反平行，= 0 表示近似垂直。
+      const double score =
+          projectionWeight * ratio + dihedralWeight * dihedralScore;
+      if (score > bestScore) {
+        bestScore = score;
         bestRatio = ratio;
         bestFaceId = faceId;
       }
@@ -491,6 +665,26 @@ class SurfaceIndex {
   const Quantizer& quantizer() const { return quantize_; }
 
  private:
+  double ClippedProjectionAreaRatioForFaceId(
+      const std::array<Vec3, 3>& midTriangle,
+      double midArea,
+      int faceId) const {
+    const auto it = faceIdToTriangles_.find(faceId);
+    if (it == faceIdToTriangles_.end()) {
+      return 0.0;
+    }
+
+    double ratio = 0.0;
+    for (const int triIndex : it->second) {
+      ratio += ClippedProjectionAreaRatio(midTriangle, triangles_[triIndex],
+                                          midArea, tolerance_);
+      if (ratio >= 1.0) {
+        return 1.0;
+      }
+    }
+    return Clamp(ratio, 0.0, 1.0);
+  }
+
   std::vector<int> CandidateTrianglesForPoint(const Vec3& point) const {
     std::vector<int> result;
     const auto it = pointToTriangles_.find(quantize_(point));
@@ -532,6 +726,7 @@ class SurfaceIndex {
   std::vector<SurfaceTriangle> triangles_;
   std::unordered_map<QuantKey, std::vector<int>, QuantKeyHash> pointToTriangles_;
   std::unordered_map<TriangleKey, std::vector<int>, TriangleKeyHash> triangleToSurface_;
+  std::map<int, std::vector<int>> faceIdToTriangles_;
   int skippedNonTriangles_ = 0;
   int skippedDegenerate_ = 0;
 };
@@ -686,9 +881,16 @@ struct OutputTriangle {
   FacePair pair{};
 };
 
+double OutputTriangleArea(const OutputTriangle& triangle, vtkPoints* points) {
+  return TriangleArea(GetPoint(points, triangle.pointIds[0]),
+                      GetPoint(points, triangle.pointIds[1]),
+                      GetPoint(points, triangle.pointIds[2]));
+}
+
 // 已处理三角形的边 -> 这条边两侧/周围出现过的 Face ID pair。
 // 四边形拆分时用它判断每条边附近应继承哪个 pair。
 using EdgePairMap = std::unordered_map<EdgeKey, std::vector<FacePair>, EdgeKeyHash>;
+using VertexPairMap = std::unordered_map<vtkIdType, std::vector<FacePair>>;
 
 void AddTriangleEdgesToMap(const OutputTriangle& triangle, EdgePairMap* edgePairs) {
   const FacePair pair = NormalizePair(triangle.pair);
@@ -696,6 +898,14 @@ void AddTriangleEdgesToMap(const OutputTriangle& triangle, EdgePairMap* edgePair
     const vtkIdType a = triangle.pointIds[i];
     const vtkIdType b = triangle.pointIds[(i + 1) % 3];
     (*edgePairs)[MakeEdgeKey(a, b)].push_back(pair);
+  }
+}
+
+void AddTriangleVerticesToMap(const OutputTriangle& triangle,
+                              VertexPairMap* vertexPairs) {
+  const FacePair pair = NormalizePair(triangle.pair);
+  for (const vtkIdType pointId : triangle.pointIds) {
+    (*vertexPairs)[pointId].push_back(pair);
   }
 }
 
@@ -747,9 +957,74 @@ FacePair FallbackPairForQuad(
   return dominant.value_or(FacePair{kUnmatchedFaceId, kUnmatchedFaceId});
 }
 
+FacePair VotePairForTriangle(const std::array<vtkIdType, 3>& triangle,
+                             const EdgePairMap& edgePairMap,
+                             const VertexPairMap& vertexPairMap,
+                             FacePair fallback) {
+  std::map<FacePair, double> scores;
+
+  for (int i = 0; i < 3; ++i) {
+    const auto edgeIt =
+        edgePairMap.find(MakeEdgeKey(triangle[i], triangle[(i + 1) % 3]));
+    if (edgeIt != edgePairMap.end()) {
+      for (const FacePair& pair : edgeIt->second) {
+        scores[NormalizePair(pair)] += 3.0;
+      }
+    }
+  }
+
+  for (const vtkIdType pointId : triangle) {
+    const auto vertexIt = vertexPairMap.find(pointId);
+    if (vertexIt != vertexPairMap.end()) {
+      for (const FacePair& pair : vertexIt->second) {
+        scores[NormalizePair(pair)] += 1.0;
+      }
+    }
+  }
+
+  if (scores.empty()) {
+    return fallback;
+  }
+  return std::max_element(
+             scores.begin(), scores.end(),
+             [](const auto& a, const auto& b) { return a.second < b.second; })
+      ->first;
+}
+
+double VoteStrengthForTriangle(const std::array<vtkIdType, 3>& triangle,
+                               const EdgePairMap& edgePairMap,
+                               const VertexPairMap& vertexPairMap) {
+  std::map<FacePair, double> scores;
+  for (int i = 0; i < 3; ++i) {
+    const auto edgeIt =
+        edgePairMap.find(MakeEdgeKey(triangle[i], triangle[(i + 1) % 3]));
+    if (edgeIt != edgePairMap.end()) {
+      for (const FacePair& pair : edgeIt->second) {
+        scores[NormalizePair(pair)] += 3.0;
+      }
+    }
+  }
+  for (const vtkIdType pointId : triangle) {
+    const auto vertexIt = vertexPairMap.find(pointId);
+    if (vertexIt != vertexPairMap.end()) {
+      for (const FacePair& pair : vertexIt->second) {
+        scores[NormalizePair(pair)] += 1.0;
+      }
+    }
+  }
+  if (scores.empty()) {
+    return 0.0;
+  }
+  return std::max_element(
+             scores.begin(), scores.end(),
+             [](const auto& a, const auto& b) { return a.second < b.second; })
+      ->second;
+}
+
 std::array<OutputTriangle, 2> SplitQuad(
     const std::array<vtkIdType, 4>& quad,
-    const EdgePairMap& edgePairMap) {
+    const EdgePairMap& edgePairMap,
+    const VertexPairMap& vertexPairMap) {
   // 四边形四条边依次为 01、12、23、30。每条边尝试从相邻三角形继承 pair。
   std::array<std::optional<FacePair>, 4> edgePairs = {
       PairForEdge(edgePairMap, quad[0], quad[1]),
@@ -782,21 +1057,219 @@ std::array<OutputTriangle, 2> SplitQuad(
   const bool split02 = v0 && v2 && NormalizePair(*v0) != NormalizePair(*v2);
   const bool split13 = v1 && v3 && NormalizePair(*v1) != NormalizePair(*v3);
 
-  if (split13 && !split02) {
+  const std::array<vtkIdType, 3> tri02A = {quad[0], quad[1], quad[2]};
+  const std::array<vtkIdType, 3> tri02B = {quad[0], quad[2], quad[3]};
+  const std::array<vtkIdType, 3> tri13A = {quad[0], quad[1], quad[3]};
+  const std::array<vtkIdType, 3> tri13B = {quad[1], quad[2], quad[3]};
+
+  const double score02 = VoteStrengthForTriangle(tri02A, edgePairMap, vertexPairMap) +
+                         VoteStrengthForTriangle(tri02B, edgePairMap, vertexPairMap);
+  const double score13 = VoteStrengthForTriangle(tri13A, edgePairMap, vertexPairMap) +
+                         VoteStrengthForTriangle(tri13B, edgePairMap, vertexPairMap);
+
+  const bool use13 = (split13 && !split02) || (!split02 && score13 > score02) ||
+                     (split13 && score13 >= score02);
+
+  if (use13) {
     const FacePair pairA =
-        PairFromOptionalList({edgePairs[0], edgePairs[3]}, fallback);
+        VotePairForTriangle(tri13A, edgePairMap, vertexPairMap, fallback);
     const FacePair pairB =
-        PairFromOptionalList({edgePairs[1], edgePairs[2]}, fallback);
-    return {OutputTriangle{{quad[0], quad[1], quad[3]}, pairA},
-            OutputTriangle{{quad[1], quad[2], quad[3]}, pairB}};
+        VotePairForTriangle(tri13B, edgePairMap, vertexPairMap, fallback);
+    return {OutputTriangle{tri13A, pairA}, OutputTriangle{tri13B, pairB}};
   }
 
   const FacePair pairA =
-      PairFromOptionalList({edgePairs[0], edgePairs[1]}, fallback);
+      VotePairForTriangle(tri02A, edgePairMap, vertexPairMap, fallback);
   const FacePair pairB =
-      PairFromOptionalList({edgePairs[2], edgePairs[3]}, fallback);
-  return {OutputTriangle{{quad[0], quad[1], quad[2]}, pairA},
-          OutputTriangle{{quad[0], quad[2], quad[3]}, pairB}};
+      VotePairForTriangle(tri02B, edgePairMap, vertexPairMap, fallback);
+  return {OutputTriangle{tri02A, pairA}, OutputTriangle{tri02B, pairB}};
+}
+
+int SmoothSmallLabelComponents(std::vector<OutputTriangle>* triangles,
+                               vtkPoints* points,
+                               int maxSmallComponentTriangles = 24,
+                               double minNeighborDominance = 1.50) {
+  if (!triangles || !points || triangles->empty()) {
+    return 0;
+  }
+
+  std::unordered_map<EdgeKey, std::vector<int>, EdgeKeyHash> edgeToTriangles;
+  edgeToTriangles.reserve(triangles->size() * 3);
+  for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
+       ++triIndex) {
+    const auto& ids = (*triangles)[triIndex].pointIds;
+    for (int i = 0; i < 3; ++i) {
+      edgeToTriangles[MakeEdgeKey(ids[i], ids[(i + 1) % 3])].push_back(triIndex);
+    }
+  }
+
+  std::vector<std::vector<int>> adjacency(triangles->size());
+  for (const auto& [edge, incidentTriangles] : edgeToTriangles) {
+    if (incidentTriangles.size() < 2) {
+      continue;
+    }
+    for (int i = 0; i < static_cast<int>(incidentTriangles.size()); ++i) {
+      for (int j = i + 1; j < static_cast<int>(incidentTriangles.size()); ++j) {
+        adjacency[incidentTriangles[i]].push_back(incidentTriangles[j]);
+        adjacency[incidentTriangles[j]].push_back(incidentTriangles[i]);
+      }
+    }
+  }
+
+  std::vector<char> visited(triangles->size(), 0);
+  std::vector<FacePair> newPairs(triangles->size());
+  for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
+    newPairs[i] = NormalizePair((*triangles)[i].pair);
+  }
+
+  int changed = 0;
+  std::vector<int> stack;
+  std::vector<int> component;
+  for (int start = 0; start < static_cast<int>(triangles->size()); ++start) {
+    if (visited[start]) {
+      continue;
+    }
+
+    const FacePair componentPair = NormalizePair((*triangles)[start].pair);
+    stack.clear();
+    component.clear();
+    stack.push_back(start);
+    visited[start] = 1;
+
+    while (!stack.empty()) {
+      const int triIndex = stack.back();
+      stack.pop_back();
+      component.push_back(triIndex);
+
+      for (const int neighbor : adjacency[triIndex]) {
+        if (visited[neighbor]) {
+          continue;
+        }
+        if (NormalizePair((*triangles)[neighbor].pair) != componentPair) {
+          continue;
+        }
+        visited[neighbor] = 1;
+        stack.push_back(neighbor);
+      }
+    }
+
+    if (static_cast<int>(component.size()) > maxSmallComponentTriangles) {
+      continue;
+    }
+
+    std::map<FacePair, double> neighborScores;
+    for (const int triIndex : component) {
+      const double area = OutputTriangleArea((*triangles)[triIndex], points);
+      for (const int neighbor : adjacency[triIndex]) {
+        const FacePair neighborPair = NormalizePair((*triangles)[neighbor].pair);
+        if (neighborPair == componentPair) {
+          continue;
+        }
+        neighborScores[neighborPair] += std::max(area, 1e-12);
+      }
+    }
+    if (neighborScores.empty()) {
+      continue;
+    }
+
+    auto best = std::max_element(
+        neighborScores.begin(), neighborScores.end(),
+        [](const auto& a, const auto& b) { return a.second < b.second; });
+    double secondScore = 0.0;
+    for (const auto& [pair, score] : neighborScores) {
+      if (pair != best->first) {
+        secondScore = std::max(secondScore, score);
+      }
+    }
+    if (secondScore > 0.0 &&
+        best->second < secondScore * minNeighborDominance) {
+      continue;
+    }
+
+    for (const int triIndex : component) {
+      newPairs[triIndex] = best->first;
+      ++changed;
+    }
+  }
+
+  for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
+    (*triangles)[i].pair = newPairs[i];
+  }
+  return changed;
+}
+
+int SmoothBoundaryJaggies(std::vector<OutputTriangle>* triangles,
+                          int maxIterations = 4) {
+  if (!triangles || triangles->empty()) {
+    return 0;
+  }
+
+  std::unordered_map<EdgeKey, std::vector<int>, EdgeKeyHash> edgeToTriangles;
+  edgeToTriangles.reserve(triangles->size() * 3);
+  for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
+       ++triIndex) {
+    const auto& ids = (*triangles)[triIndex].pointIds;
+    for (int i = 0; i < 3; ++i) {
+      edgeToTriangles[MakeEdgeKey(ids[i], ids[(i + 1) % 3])].push_back(triIndex);
+    }
+  }
+
+  std::vector<std::vector<int>> edgeNeighbors(triangles->size());
+  for (const auto& [edge, incidentTriangles] : edgeToTriangles) {
+    if (incidentTriangles.size() != 2) {
+      continue;
+    }
+    edgeNeighbors[incidentTriangles[0]].push_back(incidentTriangles[1]);
+    edgeNeighbors[incidentTriangles[1]].push_back(incidentTriangles[0]);
+  }
+
+  int totalChanged = 0;
+  for (int iteration = 0; iteration < maxIterations; ++iteration) {
+    std::vector<FacePair> newPairs(triangles->size());
+    std::vector<char> shouldChange(triangles->size(), 0);
+    for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
+      newPairs[i] = NormalizePair((*triangles)[i].pair);
+    }
+
+    int changedThisIteration = 0;
+    for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
+         ++triIndex) {
+      const FacePair current = NormalizePair((*triangles)[triIndex].pair);
+      std::map<FacePair, int> neighborCounts;
+      for (const int neighbor : edgeNeighbors[triIndex]) {
+        const FacePair neighborPair = NormalizePair((*triangles)[neighbor].pair);
+        if (neighborPair != current) {
+          ++neighborCounts[neighborPair];
+        }
+      }
+
+      if (neighborCounts.empty()) {
+        continue;
+      }
+      const auto best = std::max_element(
+          neighborCounts.begin(), neighborCounts.end(),
+          [](const auto& a, const auto& b) { return a.second < b.second; });
+
+      // 锯齿错误的典型形态：一个三角形伸进另一侧，至少两条共享边邻居同属另一 ID。
+      if (best->second >= 2) {
+        newPairs[triIndex] = best->first;
+        shouldChange[triIndex] = 1;
+        ++changedThisIteration;
+      }
+    }
+
+    if (changedThisIteration == 0) {
+      break;
+    }
+    for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
+      if (shouldChange[i]) {
+        (*triangles)[i].pair = newPairs[i];
+      }
+    }
+    totalChanged += changedThisIteration;
+  }
+
+  return totalChanged;
 }
 
 double ComputeDefaultTolerance(vtkPolyData* surface,
@@ -954,7 +1427,8 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
                       const std::string& midSurfacePath,
                       const std::string& outputPath,
                       double tolerance,
-                      double projectionThreshold) {
+                      double projectionThreshold,
+                      double dihedralWeight) {
   // 入口函数：读入三个 VTK 文件，输出全三角形且带 surface_id 的中面网格。
   vtkSmartPointer<vtkDataSet> surfaceDataSet = ReadDataSet(surfaceMeshPath);
   vtkSmartPointer<vtkUnstructuredGrid> volume = ReadUnstructuredGrid(volumeMeshPath);
@@ -983,6 +1457,7 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
     tolerance = ComputeDefaultTolerance(surface, volume, midSurface);
   }
   projectionThreshold = std::clamp(projectionThreshold, 0.0, 1.0);
+  dihedralWeight = std::clamp(dihedralWeight, 0.0, 1.0);
 
   SurfaceIndex surfaceIndex(surface, tolerance);
   if (!surfaceIndex.Build()) {
@@ -998,6 +1473,7 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
   std::vector<OutputTriangle> outputTriangles;
   std::vector<std::array<vtkIdType, 4>> quads;
   EdgePairMap edgePairMap;
+  VertexPairMap vertexPairMap;
   int unmappedTriangles = 0;
   int skippedCells = 0;
 
@@ -1028,12 +1504,13 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
         }
 
         // 三点侧：直接由四面体中非公共端点组成的 surface 三角形确定。
-        const int firstFaceId =
-            surfaceIndex.FindFaceIdForSurfaceTriangle(surfaceFacePoints);
+        const SurfaceFaceMatch firstFace =
+            surfaceIndex.FindSurfaceTriangleMatch(surfaceFacePoints);
         // 单点侧：判断公共端点落在哪个 Face ID 上；边界点按投影比例筛选。
         const int secondFaceId = surfaceIndex.FindFaceIdForPoint(
-            GetPoint(volume, match.singlePoint), &midPoints, projectionThreshold);
-        pair = NormalizePair({firstFaceId, secondFaceId});
+            GetPoint(volume, match.singlePoint), &midPoints, projectionThreshold,
+            &firstFace.normal, dihedralWeight);
+        pair = NormalizePair({firstFace.faceId, secondFaceId});
       } else {
         ++unmappedTriangles;
       }
@@ -1042,6 +1519,7 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
       outputTriangles.push_back(triangle);
       // 记录三角形边上的 pair，后续四边形拆分时用于继承局部区域 ID。
       AddTriangleEdgesToMap(triangle, &edgePairMap);
+      AddTriangleVerticesToMap(triangle, &vertexPairMap);
       continue;
     }
 
@@ -1059,10 +1537,14 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
 
   // 第二步：把四边形全部拆成三角形，并从相邻三角形边继承 Face ID pair。
   for (const auto& quad : quads) {
-    const auto split = SplitQuad(quad, edgePairMap);
+    const auto split = SplitQuad(quad, edgePairMap, vertexPairMap);
     outputTriangles.push_back(split[0]);
     outputTriangles.push_back(split[1]);
   }
+
+  const int smoothedTriangles =
+      SmoothSmallLabelComponents(&outputTriangles, midSurface->GetPoints());
+  const int jaggySmoothedTriangles = SmoothBoundaryJaggies(&outputTriangles);
 
   vtkNew<vtkPolyData> output;
   vtkNew<vtkPoints> points;
@@ -1118,6 +1600,14 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
   std::cerr << "Wrote " << outputTriangles.size() << " triangles to "
             << outputPath << ". Surface relation count: " << nextSurfaceId
             << ".\n";
+  if (smoothedTriangles > 0) {
+    std::cerr << "Relabeled " << smoothedTriangles
+              << " small boundary/component triangles by neighborhood voting.\n";
+  }
+  if (jaggySmoothedTriangles > 0) {
+    std::cerr << "Relabeled " << jaggySmoothedTriangles
+              << " jaggy boundary triangles by edge-neighborhood voting.\n";
+  }
   if (unmappedTriangles > 0) {
     std::cerr << "Warning: " << unmappedTriangles
               << " mid-surface triangles could not be matched to a tetrahedron.\n";
@@ -1131,10 +1621,11 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
 
 #ifdef MID_SURFACE_MAPPER_BUILD_CLI
 int main(int argc, char** argv) {
-  if (argc < 5 || argc > 7) {
+  if (argc < 5 || argc > 8) {
     std::cerr << "Usage: " << argv[0]
               << " surface_mesh.vtk volume_mesh.vtk mid_surface.vtk "
-                 "mid_surface_tri.vtk [tolerance] [projection_threshold]\n";
+                 "mid_surface_tri.vtk [tolerance] [projection_threshold] "
+                 "[dihedral_weight]\n";
     return EXIT_FAILURE;
   }
 
@@ -1143,13 +1634,20 @@ int main(int argc, char** argv) {
     tolerance = std::atof(argv[5]);
   }
 
-  double projectionThreshold = 0.70;
+  // 投影面积比例阈值
+  double projectionThreshold = 0.30;
   if (argc >= 7) {
     projectionThreshold = std::atof(argv[6]);
   }
 
+  // 二面角权重
+  double dihedralWeight = 0.90;
+  if (argc >= 8) {
+    dihedralWeight = std::atof(argv[7]);
+  }
+
   return MapMidSurfaceIds(argv[1], argv[2], argv[3], argv[4], tolerance,
-                          projectionThreshold)
+                          projectionThreshold, dihedralWeight)
              ? EXIT_SUCCESS
              : EXIT_FAILURE;
 }

@@ -11,10 +11,12 @@
 // - outputPath: 输出全三角形中面网格 vtk 文件。
 //
 // tolerance <= 0 时会按模型包围盒自动估计容差。
-// projectionThreshold 默认为 0.70，对应任务说明里的“投影面积超过 70%”。
+// projectionThreshold 为投影面积比例阈值，范围0~1
+// dihedralWeight 控制二面角在边界候选面评分中的权重，范围0~1。
 bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
                       const std::string& volumeMeshPath,
                       const std::string& midSurfacePath,
                       const std::string& outputPath,
                       double tolerance = -1.0,
-                      double projectionThreshold = 0.70);
+                      double projectionThreshold = 0.70,
+                      double dihedralWeight = 0.35);
