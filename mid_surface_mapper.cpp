@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -246,6 +247,11 @@ bool IsValidPair(FacePair pair) {
   return !(pair.first == kUnmatchedFaceId && pair.second == kUnmatchedFaceId);
 }
 
+bool IsLowConfidencePair(FacePair pair) {
+  pair = NormalizePair(pair);
+  return pair.first == kUnmatchedFaceId || pair.second == kUnmatchedFaceId;
+}
+
 // 原始 surface_mesh 中的一个三角形及其 Face ID。
 // Build() 时会把这些三角形放进多个索引，后面用来查：
 // 1. 某个四面体面（三个顶点）属于哪个 Face ID；
@@ -264,6 +270,42 @@ struct SurfaceTriangle {
 struct SurfaceFaceMatch {
   int faceId = kUnmatchedFaceId;
   Vec3 normal{};
+};
+
+struct SurfacePointEvidence {
+  int faceId = kUnmatchedFaceId;
+  double confidence = 0.0;
+  double bestRatio = 0.0;
+  double secondRatio = 0.0;
+  double bestScore = 0.0;
+  double secondScore = 0.0;
+  int candidateFaces = 0;
+  bool interior = false;
+
+  SurfacePointEvidence() = default;
+  SurfacePointEvidence(int id)
+      : faceId(id),
+        confidence(id == kUnmatchedFaceId ? 0.0 : 1.0),
+        bestRatio(id == kUnmatchedFaceId ? 0.0 : 1.0),
+        bestScore(id == kUnmatchedFaceId ? 0.0 : 1.0),
+        candidateFaces(id == kUnmatchedFaceId ? 0 : 1),
+        interior(id != kUnmatchedFaceId) {}
+  SurfacePointEvidence(int id,
+                       double confidenceValue,
+                       double bestRatioValue,
+                       double secondRatioValue,
+                       double bestScoreValue,
+                       double secondScoreValue,
+                       int candidateFaceCount,
+                       bool isInterior)
+      : faceId(id),
+        confidence(confidenceValue),
+        bestRatio(bestRatioValue),
+        secondRatio(secondRatioValue),
+        bestScore(bestScoreValue),
+        secondScore(secondScoreValue),
+        candidateFaces(candidateFaceCount),
+        interior(isInterior) {}
 };
 
 bool IsNameMatch(const std::string& name, const std::string& expected) {
@@ -586,6 +628,18 @@ class SurfaceIndex {
                          double projectionThreshold,
                          const Vec3* preferredParallelNormal,
                          double dihedralWeight) const {
+    return FindFaceIdEvidenceForPoint(point, midTriangle, projectionThreshold,
+                                      preferredParallelNormal,
+                                      dihedralWeight)
+        .faceId;
+  }
+
+  SurfacePointEvidence FindFaceIdEvidenceForPoint(
+      const Vec3& point,
+      const std::array<Vec3, 3>* midTriangle,
+      double projectionThreshold,
+      const Vec3* preferredParallelNormal,
+      double dihedralWeight) const {
     // 先通过量化后的点坐标查候选 surface 三角形；没找到再扫包围盒兜底。
     std::vector<int> candidates = CandidateTrianglesForPoint(point);
     if (candidates.empty()) {
@@ -627,14 +681,20 @@ class SurfaceIndex {
     }
 
     if (faceCounts.empty()) {
-      return kUnmatchedFaceId;
+      return {};
+    }
+    if (faceCounts.size() == 1) {
+      const int faceId = faceCounts.begin()->first;
+      return {faceId, 1.0, 1.0, 0.0, 1.0, 0.0,
+              static_cast<int>(faceCounts.size()), true};
     }
     if (faceCounts.size() == 1) {
       // 点只落在一个 Face ID 上：属于“点在面内部”的情况，直接使用该 Face ID。
       return faceCounts.begin()->first;
     }
     if (!midTriangle || midArea <= tolerance_ * tolerance_) {
-      return kUnmatchedFaceId;
+      return {kUnmatchedFaceId, 0.0, 0.0, 0.0, 0.0, 0.0,
+              static_cast<int>(faceCounts.size()), false};
     }
 
     // 投影面积按整个 Face ID 区域累计，而不是只取包含边界点的单个三角形。
@@ -646,6 +706,8 @@ class SurfaceIndex {
     int bestFaceId = kUnmatchedFaceId;
     double bestScore = -1.0;
     double bestRatio = -1.0;
+    double secondScore = -1.0;
+    double secondRatio = 0.0;
     dihedralWeight = Clamp(dihedralWeight, 0.0, 1.0);
     const double projectionWeight = 1.0 - dihedralWeight;
     for (const auto& [faceId, ratio] : faceToProjectionRatio) {
@@ -657,12 +719,31 @@ class SurfaceIndex {
       const double score =
           projectionWeight * ratio + dihedralWeight * dihedralScore;
       if (score > bestScore) {
+        secondScore = bestScore;
+        secondRatio = bestRatio;
         bestScore = score;
         bestRatio = ratio;
         bestFaceId = faceId;
+      } else if (score > secondScore) {
+        secondScore = score;
+        secondRatio = ratio;
       }
     }
 
+    if (bestRatio > projectionThreshold) {
+      const double ratioMargin = std::max(0.0, bestRatio - secondRatio);
+      const double scoreMargin = std::max(0.0, bestScore - secondScore);
+      const double thresholdSpan = std::max(1e-6, 1.0 - projectionThreshold);
+      const double thresholdMargin =
+          std::max(0.0, bestRatio - projectionThreshold) / thresholdSpan;
+      const double confidence =
+          Clamp(0.50 + 0.25 * thresholdMargin + 0.35 * ratioMargin +
+                    0.20 * scoreMargin,
+                0.50, 0.98);
+      return {bestFaceId, confidence, bestRatio, std::max(0.0, secondRatio),
+              bestScore, std::max(0.0, secondScore),
+              static_cast<int>(faceCounts.size()), false};
+    }
     if (bestRatio > projectionThreshold) {
       // 点落在边界上时，只有投影面积比例超过阈值才认为匹配该面。
       return bestFaceId;
@@ -919,12 +1000,116 @@ class VolumeMidpointIndex {
 struct OutputTriangle {
   std::array<vtkIdType, 3> pointIds{};
   FacePair pair{};
+  double confidence = 0.0;
 };
+
+struct TriangleNeighbor {
+  int triangle = -1;
+  double edgeLength = 0.0;
+};
+
+struct TriangleTopology {
+  std::vector<std::vector<TriangleNeighbor>> neighbors;
+  std::vector<char> boundaryBand;
+};
+
+bool IsLowConfidenceTriangle(const OutputTriangle& triangle) {
+  return triangle.confidence < 0.75 || IsLowConfidencePair(triangle.pair);
+}
+
+int CountUnmatchedPairs(const std::vector<OutputTriangle>& triangles) {
+  int count = 0;
+  for (const OutputTriangle& triangle : triangles) {
+    const FacePair pair = NormalizePair(triangle.pair);
+    if (pair.first == kUnmatchedFaceId && pair.second == kUnmatchedFaceId) {
+      ++count;
+    }
+  }
+  return count;
+}
 
 double OutputTriangleArea(const OutputTriangle& triangle, vtkPoints* points) {
   return TriangleArea(GetPoint(points, triangle.pointIds[0]),
                       GetPoint(points, triangle.pointIds[1]),
                       GetPoint(points, triangle.pointIds[2]));
+}
+
+TriangleTopology BuildTriangleTopology(
+    const std::vector<OutputTriangle>& triangles,
+    vtkPoints* points,
+    int boundaryBandHops = 2) {
+  TriangleTopology topology;
+  topology.neighbors.resize(triangles.size());
+  topology.boundaryBand.assign(triangles.size(), 0);
+  if (!points || triangles.empty()) {
+    return topology;
+  }
+
+  std::unordered_map<EdgeKey, std::vector<int>, EdgeKeyHash> edgeToTriangles;
+  edgeToTriangles.reserve(triangles.size() * 3);
+  for (int triIndex = 0; triIndex < static_cast<int>(triangles.size());
+       ++triIndex) {
+    const auto& ids = triangles[triIndex].pointIds;
+    for (int i = 0; i < 3; ++i) {
+      edgeToTriangles[MakeEdgeKey(ids[i], ids[(i + 1) % 3])].push_back(triIndex);
+    }
+  }
+
+  std::deque<std::pair<int, int>> queue;
+  const auto seedBoundary = [&](int triIndex) {
+    if (!topology.boundaryBand[triIndex]) {
+      topology.boundaryBand[triIndex] = 1;
+      queue.push_back({triIndex, 0});
+    }
+  };
+
+  for (const auto& [edge, incidentTriangles] : edgeToTriangles) {
+    const double length = Norm(GetPoint(points, edge.a) - GetPoint(points, edge.b));
+    if (incidentTriangles.size() == 2) {
+      const int a = incidentTriangles[0];
+      const int b = incidentTriangles[1];
+      topology.neighbors[a].push_back({b, length});
+      topology.neighbors[b].push_back({a, length});
+      if (NormalizePair(triangles[a].pair) != NormalizePair(triangles[b].pair)) {
+        seedBoundary(a);
+        seedBoundary(b);
+      }
+      continue;
+    }
+
+    for (const int triIndex : incidentTriangles) {
+      seedBoundary(triIndex);
+    }
+  }
+
+  boundaryBandHops = std::max(0, boundaryBandHops);
+  while (!queue.empty()) {
+    const auto [triIndex, distance] = queue.front();
+    queue.pop_front();
+    if (distance >= boundaryBandHops) {
+      continue;
+    }
+    for (const TriangleNeighbor& neighbor : topology.neighbors[triIndex]) {
+      if (!topology.boundaryBand[neighbor.triangle]) {
+        topology.boundaryBand[neighbor.triangle] = 1;
+        queue.push_back({neighbor.triangle, distance + 1});
+      }
+    }
+  }
+
+  return topology;
+}
+
+bool ComponentIntersectsBoundaryBand(const std::vector<int>& component,
+                                     const TriangleTopology& topology) {
+  for (const int triIndex : component) {
+    if (triIndex >= 0 &&
+        triIndex < static_cast<int>(topology.boundaryBand.size()) &&
+        topology.boundaryBand[triIndex]) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // 已处理三角形的边 -> 这条边两侧/周围出现过的 Face ID pair。
@@ -952,6 +1137,33 @@ void AddTriangleVerticesToMap(const OutputTriangle& triangle,
   }
   for (const vtkIdType pointId : triangle.pointIds) {
     (*vertexPairs)[pointId].push_back(pair);
+  }
+}
+
+void AddQuadBoundaryToMaps(const std::array<vtkIdType, 4>& quad,
+                           const std::array<OutputTriangle, 2>& split,
+                           EdgePairMap* edgePairs,
+                           VertexPairMap* vertexPairs) {
+  for (const OutputTriangle& triangle : split) {
+    const FacePair pair = NormalizePair(triangle.pair);
+    if (!IsValidPair(pair)) {
+      continue;
+    }
+
+    for (int i = 0; i < 3; ++i) {
+      const vtkIdType a = triangle.pointIds[i];
+      const vtkIdType b = triangle.pointIds[(i + 1) % 3];
+      for (int q = 0; q < 4; ++q) {
+        if (MakeEdgeKey(a, b) == MakeEdgeKey(quad[q], quad[(q + 1) % 4])) {
+          (*edgePairs)[MakeEdgeKey(a, b)].push_back(pair);
+          break;
+        }
+      }
+    }
+
+    for (const vtkIdType pointId : triangle.pointIds) {
+      (*vertexPairs)[pointId].push_back(pair);
+    }
   }
 }
 
@@ -1143,14 +1355,28 @@ std::array<OutputTriangle, 2> SplitQuad(
         VotePairForTriangle(tri13A, edgePairMap, vertexPairMap, fallback);
     const FacePair pairB =
         VotePairForTriangle(tri13B, edgePairMap, vertexPairMap, fallback);
-    return {OutputTriangle{tri13A, pairA}, OutputTriangle{tri13B, pairB}};
+    return {OutputTriangle{tri13A, pairA,
+                           IsValidPair(pairA)
+                               ? (IsLowConfidencePair(pairA) ? 0.45 : 0.85)
+                               : 0.0},
+            OutputTriangle{tri13B, pairB,
+                           IsValidPair(pairB)
+                               ? (IsLowConfidencePair(pairB) ? 0.45 : 0.85)
+                               : 0.0}};
   }
 
   const FacePair pairA =
       VotePairForTriangle(tri02A, edgePairMap, vertexPairMap, fallback);
   const FacePair pairB =
       VotePairForTriangle(tri02B, edgePairMap, vertexPairMap, fallback);
-  return {OutputTriangle{tri02A, pairA}, OutputTriangle{tri02B, pairB}};
+  return {OutputTriangle{tri02A, pairA,
+                         IsValidPair(pairA)
+                             ? (IsLowConfidencePair(pairA) ? 0.45 : 0.85)
+                             : 0.0},
+          OutputTriangle{tri02B, pairB,
+                         IsValidPair(pairB)
+                             ? (IsLowConfidencePair(pairB) ? 0.45 : 0.85)
+                             : 0.0}};
 }
 
 bool CanSplitQuadFromKnownNeighbors(const std::array<vtkIdType, 4>& quad,
@@ -1184,33 +1410,14 @@ bool CanSplitQuadFromKnownNeighbors(const std::array<vtkIdType, 4>& quad,
 int SmoothSmallLabelComponents(std::vector<OutputTriangle>* triangles,
                                vtkPoints* points,
                                int maxSmallComponentTriangles = 24,
-                               double minNeighborDominance = 1.50) {
+                               double minNeighborDominance = 1.50,
+                               bool protectHighConfidence = true) {
   if (!triangles || !points || triangles->empty()) {
     return 0;
   }
 
-  std::unordered_map<EdgeKey, std::vector<int>, EdgeKeyHash> edgeToTriangles;
-  edgeToTriangles.reserve(triangles->size() * 3);
-  for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
-       ++triIndex) {
-    const auto& ids = (*triangles)[triIndex].pointIds;
-    for (int i = 0; i < 3; ++i) {
-      edgeToTriangles[MakeEdgeKey(ids[i], ids[(i + 1) % 3])].push_back(triIndex);
-    }
-  }
-
-  std::vector<std::vector<int>> adjacency(triangles->size());
-  for (const auto& [edge, incidentTriangles] : edgeToTriangles) {
-    if (incidentTriangles.size() < 2) {
-      continue;
-    }
-    for (int i = 0; i < static_cast<int>(incidentTriangles.size()); ++i) {
-      for (int j = i + 1; j < static_cast<int>(incidentTriangles.size()); ++j) {
-        adjacency[incidentTriangles[i]].push_back(incidentTriangles[j]);
-        adjacency[incidentTriangles[j]].push_back(incidentTriangles[i]);
-      }
-    }
-  }
+  const TriangleTopology topology =
+      BuildTriangleTopology(*triangles, points, /*boundaryBandHops=*/2);
 
   std::vector<char> visited(triangles->size(), 0);
   std::vector<FacePair> newPairs(triangles->size());
@@ -1237,31 +1444,43 @@ int SmoothSmallLabelComponents(std::vector<OutputTriangle>* triangles,
       stack.pop_back();
       component.push_back(triIndex);
 
-      for (const int neighbor : adjacency[triIndex]) {
-        if (visited[neighbor]) {
+      for (const TriangleNeighbor& neighbor : topology.neighbors[triIndex]) {
+        if (visited[neighbor.triangle]) {
           continue;
         }
-        if (NormalizePair((*triangles)[neighbor].pair) != componentPair) {
+        if (NormalizePair((*triangles)[neighbor.triangle].pair) != componentPair) {
           continue;
         }
-        visited[neighbor] = 1;
-        stack.push_back(neighbor);
+        visited[neighbor.triangle] = 1;
+        stack.push_back(neighbor.triangle);
       }
     }
 
-    if (static_cast<int>(component.size()) > maxSmallComponentTriangles) {
+    bool lowConfidenceComponent = IsLowConfidencePair(componentPair);
+    for (const int triIndex : component) {
+      lowConfidenceComponent =
+          lowConfidenceComponent || IsLowConfidenceTriangle((*triangles)[triIndex]);
+    }
+    const bool tinyCompleteComponent =
+        static_cast<int>(component.size()) <= 3;
+    const bool boundaryComponent =
+        ComponentIntersectsBoundaryBand(component, topology);
+    if (static_cast<int>(component.size()) > maxSmallComponentTriangles ||
+        (!boundaryComponent && !lowConfidenceComponent) ||
+        (protectHighConfidence && !lowConfidenceComponent &&
+         !tinyCompleteComponent)) {
       continue;
     }
 
     std::map<FacePair, double> neighborScores;
     for (const int triIndex : component) {
-      const double area = OutputTriangleArea((*triangles)[triIndex], points);
-      for (const int neighbor : adjacency[triIndex]) {
-        const FacePair neighborPair = NormalizePair((*triangles)[neighbor].pair);
+      for (const TriangleNeighbor& neighbor : topology.neighbors[triIndex]) {
+        const FacePair neighborPair =
+            NormalizePair((*triangles)[neighbor.triangle].pair);
         if (neighborPair == componentPair) {
           continue;
         }
-        neighborScores[neighborPair] += std::max(area, 1e-12);
+        neighborScores[neighborPair] += std::max(neighbor.edgeLength, 1e-12);
       }
     }
     if (neighborScores.empty()) {
@@ -1277,13 +1496,17 @@ int SmoothSmallLabelComponents(std::vector<OutputTriangle>* triangles,
         secondScore = std::max(secondScore, score);
       }
     }
-    if (secondScore > 0.0 &&
-        best->second < secondScore * minNeighborDominance) {
+    const double requiredDominance =
+        (!protectHighConfidence || lowConfidenceComponent) ? minNeighborDominance
+                                                          : 2.50;
+    if (secondScore > 0.0 && best->second < secondScore * requiredDominance) {
       continue;
     }
 
     for (const int triIndex : component) {
       newPairs[triIndex] = best->first;
+      (*triangles)[triIndex].confidence =
+          std::max((*triangles)[triIndex].confidence, 0.65);
       ++changed;
     }
   }
@@ -1295,32 +1518,17 @@ int SmoothSmallLabelComponents(std::vector<OutputTriangle>* triangles,
 }
 
 int SmoothBoundaryJaggies(std::vector<OutputTriangle>* triangles,
-                          int maxIterations = 4) {
-  if (!triangles || triangles->empty()) {
+                          vtkPoints* points,
+                          int maxIterations = 2,
+                          bool protectHighConfidence = true) {
+  if (!triangles || !points || triangles->empty()) {
     return 0;
-  }
-
-  std::unordered_map<EdgeKey, std::vector<int>, EdgeKeyHash> edgeToTriangles;
-  edgeToTriangles.reserve(triangles->size() * 3);
-  for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
-       ++triIndex) {
-    const auto& ids = (*triangles)[triIndex].pointIds;
-    for (int i = 0; i < 3; ++i) {
-      edgeToTriangles[MakeEdgeKey(ids[i], ids[(i + 1) % 3])].push_back(triIndex);
-    }
-  }
-
-  std::vector<std::vector<int>> edgeNeighbors(triangles->size());
-  for (const auto& [edge, incidentTriangles] : edgeToTriangles) {
-    if (incidentTriangles.size() != 2) {
-      continue;
-    }
-    edgeNeighbors[incidentTriangles[0]].push_back(incidentTriangles[1]);
-    edgeNeighbors[incidentTriangles[1]].push_back(incidentTriangles[0]);
   }
 
   int totalChanged = 0;
   for (int iteration = 0; iteration < maxIterations; ++iteration) {
+    const TriangleTopology topology =
+        BuildTriangleTopology(*triangles, points, /*boundaryBandHops=*/1);
     std::vector<FacePair> newPairs(triangles->size());
     std::vector<char> shouldChange(triangles->size(), 0);
     for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
@@ -1331,27 +1539,62 @@ int SmoothBoundaryJaggies(std::vector<OutputTriangle>* triangles,
     for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
          ++triIndex) {
       const FacePair current = NormalizePair((*triangles)[triIndex].pair);
-      std::map<FacePair, int> neighborCounts;
-      for (const int neighbor : edgeNeighbors[triIndex]) {
-        const FacePair neighborPair = NormalizePair((*triangles)[neighbor].pair);
-        if (neighborPair != current) {
-          ++neighborCounts[neighborPair];
-        }
+      const bool lowConfidenceTriangle =
+          IsLowConfidenceTriangle((*triangles)[triIndex]);
+      if (!lowConfidenceTriangle &&
+          triIndex < static_cast<int>(topology.boundaryBand.size()) &&
+          !topology.boundaryBand[triIndex]) {
+        continue;
       }
 
-      if (neighborCounts.empty()) {
+      std::map<FacePair, double> neighborSupport;
+      std::map<FacePair, int> neighborCounts;
+      double sameSupport = 0.0;
+      for (const TriangleNeighbor& neighbor : topology.neighbors[triIndex]) {
+        const FacePair neighborPair =
+            NormalizePair((*triangles)[neighbor.triangle].pair);
+        if (neighborPair == current) {
+          sameSupport += neighbor.edgeLength;
+          continue;
+        }
+        neighborSupport[neighborPair] += neighbor.edgeLength;
+        ++neighborCounts[neighborPair];
+      }
+
+      if (neighborSupport.empty()) {
         continue;
       }
       const auto best = std::max_element(
-          neighborCounts.begin(), neighborCounts.end(),
+          neighborSupport.begin(), neighborSupport.end(),
           [](const auto& a, const auto& b) { return a.second < b.second; });
 
-      // 锯齿错误的典型形态：一个三角形伸进另一侧，至少两条共享边邻居同属另一 ID。
-      if (best->second >= 2) {
-        newPairs[triIndex] = best->first;
-        shouldChange[triIndex] = 1;
-        ++changedThisIteration;
+      double secondSupport = 0.0;
+      for (const auto& [pair, support] : neighborSupport) {
+        if (pair != best->first) {
+          secondSupport = std::max(secondSupport, support);
+        }
       }
+
+      const int requiredVotes =
+          (lowConfidenceTriangle || !protectHighConfidence) ? 1 : 2;
+      if (neighborCounts[best->first] < requiredVotes) {
+        continue;
+      }
+      const double dominance =
+          lowConfidenceTriangle ? 1.05 : (protectHighConfidence ? 1.35 : 1.15);
+      if (sameSupport > 0.0 && best->second < sameSupport * dominance) {
+        continue;
+      }
+      const double secondDominance = lowConfidenceTriangle ? 1.20 : 1.50;
+      if (secondSupport > 0.0 && best->second < secondSupport * secondDominance) {
+        continue;
+      }
+
+      newPairs[triIndex] = best->first;
+      (*triangles)[triIndex].confidence =
+          std::max((*triangles)[triIndex].confidence, 0.65);
+      shouldChange[triIndex] = 1;
+      ++changedThisIteration;
     }
 
     if (changedThisIteration == 0) {
@@ -1360,6 +1603,126 @@ int SmoothBoundaryJaggies(std::vector<OutputTriangle>* triangles,
     for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
       if (shouldChange[i]) {
         (*triangles)[i].pair = newPairs[i];
+      }
+    }
+    totalChanged += changedThisIteration;
+  }
+
+  return totalChanged;
+}
+
+double RelabelDataPenalty(const OutputTriangle& triangle,
+                          FacePair candidate,
+                          double lengthScale) {
+  const FacePair original = NormalizePair(triangle.pair);
+  if (candidate == original) {
+    return 0.0;
+  }
+
+  const double confidence = Clamp(triangle.confidence, 0.0, 1.0);
+  double penalty = lengthScale * (0.06 + 0.90 * confidence * confidence);
+  if (IsLowConfidencePair(original)) {
+    penalty *= 0.45;
+  }
+  if (IsLowConfidencePair(candidate) && !IsLowConfidencePair(original)) {
+    penalty += lengthScale * 0.20;
+  }
+  return penalty;
+}
+
+int OptimizeBoundaryByLocalEnergy(std::vector<OutputTriangle>* triangles,
+                                  vtkPoints* points,
+                                  int maxIterations = 4,
+                                  int boundaryBandHops = 2) {
+  if (!triangles || !points || triangles->empty()) {
+    return 0;
+  }
+
+  std::vector<FacePair> labels(triangles->size());
+  for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
+    labels[i] = NormalizePair((*triangles)[i].pair);
+  }
+
+  int totalChanged = 0;
+  for (int iteration = 0; iteration < maxIterations; ++iteration) {
+    const TriangleTopology topology =
+        BuildTriangleTopology(*triangles, points, boundaryBandHops);
+
+    double totalEdgeLength = 0.0;
+    int edgeCount = 0;
+    for (const auto& neighbors : topology.neighbors) {
+      for (const TriangleNeighbor& neighbor : neighbors) {
+        totalEdgeLength += neighbor.edgeLength;
+        ++edgeCount;
+      }
+    }
+    const double lengthScale =
+        edgeCount > 0 ? totalEdgeLength / edgeCount : 1.0;
+    const double minImprovement = lengthScale * 0.02;
+
+    int changedThisIteration = 0;
+    for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
+         ++triIndex) {
+      const bool inBoundaryBand =
+          triIndex < static_cast<int>(topology.boundaryBand.size()) &&
+          topology.boundaryBand[triIndex];
+      const bool lowConfidenceTriangle =
+          IsLowConfidenceTriangle((*triangles)[triIndex]);
+      if (!inBoundaryBand && !lowConfidenceTriangle) {
+        continue;
+      }
+
+      std::set<FacePair> candidates = {labels[triIndex]};
+      for (const TriangleNeighbor& neighbor : topology.neighbors[triIndex]) {
+        candidates.insert(labels[neighbor.triangle]);
+      }
+      if (candidates.size() <= 1) {
+        continue;
+      }
+
+      const auto localEnergy = [&](FacePair candidate) {
+        double energy =
+            RelabelDataPenalty((*triangles)[triIndex], candidate, lengthScale);
+        for (const TriangleNeighbor& neighbor : topology.neighbors[triIndex]) {
+          if (candidate != labels[neighbor.triangle]) {
+            energy += neighbor.edgeLength;
+          }
+        }
+        return energy;
+      };
+
+      const FacePair current = labels[triIndex];
+      FacePair bestPair = current;
+      double bestEnergy = localEnergy(current);
+      for (const FacePair& candidate : candidates) {
+        if (candidate == current) {
+          continue;
+        }
+        if (IsLowConfidencePair(candidate) && !IsLowConfidencePair(current)) {
+          continue;
+        }
+        const double trialEnergy = localEnergy(candidate);
+        if (trialEnergy + minImprovement < bestEnergy) {
+          bestEnergy = trialEnergy;
+          bestPair = candidate;
+        }
+      }
+
+      if (bestPair != current) {
+        labels[triIndex] = bestPair;
+        ++changedThisIteration;
+      }
+    }
+
+    if (changedThisIteration == 0) {
+      break;
+    }
+
+    for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
+      if (NormalizePair((*triangles)[i].pair) != labels[i]) {
+        (*triangles)[i].pair = labels[i];
+        (*triangles)[i].confidence =
+            std::max((*triangles)[i].confidence, 0.65);
       }
     }
     totalChanged += changedThisIteration;
@@ -1468,12 +1831,214 @@ std::vector<std::vector<int>> BuildEdgeNeighbors(
   return neighbors;
 }
 
+int CompletePartialPairs(std::vector<OutputTriangle>* triangles,
+                         int maxIterations = 6) {
+  if (!triangles || triangles->empty()) {
+    return 0;
+  }
+
+  const auto neighbors = BuildEdgeNeighbors(*triangles);
+  int totalChanged = 0;
+  for (int iteration = 0; iteration < maxIterations; ++iteration) {
+    std::vector<FacePair> newPairs(triangles->size());
+    std::vector<char> shouldChange(triangles->size(), 0);
+    for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
+      newPairs[i] = NormalizePair((*triangles)[i].pair);
+    }
+
+    int changedThisIteration = 0;
+    for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
+         ++triIndex) {
+      const FacePair current = NormalizePair((*triangles)[triIndex].pair);
+      const bool hasFirst = current.first != kUnmatchedFaceId;
+      const bool hasSecond = current.second != kUnmatchedFaceId;
+      if (hasFirst == hasSecond) {
+        continue;
+      }
+
+      const int knownFace = hasFirst ? current.first : current.second;
+      std::map<FacePair, int> votes;
+      for (const int neighbor : neighbors[triIndex]) {
+        const FacePair neighborPair = NormalizePair((*triangles)[neighbor].pair);
+        if (IsLowConfidencePair(neighborPair)) {
+          continue;
+        }
+        if (neighborPair.first == knownFace || neighborPair.second == knownFace) {
+          ++votes[neighborPair];
+        }
+      }
+      if (votes.empty()) {
+        continue;
+      }
+
+      const auto best = std::max_element(
+          votes.begin(), votes.end(),
+          [](const auto& a, const auto& b) { return a.second < b.second; });
+      int second = 0;
+      for (const auto& [pair, count] : votes) {
+        if (pair != best->first) {
+          second = std::max(second, count);
+        }
+      }
+      if (best->second < 2 && second > 0) {
+        continue;
+      }
+
+      newPairs[triIndex] = best->first;
+      shouldChange[triIndex] = 1;
+      ++changedThisIteration;
+    }
+
+    if (changedThisIteration == 0) {
+      break;
+    }
+    for (int i = 0; i < static_cast<int>(triangles->size()); ++i) {
+      if (shouldChange[i]) {
+        (*triangles)[i].pair = newPairs[i];
+        (*triangles)[i].confidence =
+            std::max((*triangles)[i].confidence, 0.70);
+      }
+    }
+    totalChanged += changedThisIteration;
+  }
+
+  return totalChanged;
+}
+
+int CorrectBoundarySideOutliers(std::vector<OutputTriangle>* triangles,
+                                vtkPoints* points,
+                                int maxComponentTriangles = 6,
+                                double minOppositeContactRatio = 1.45) {
+  if (!triangles || !points || triangles->empty()) {
+    return 0;
+  }
+
+  const TriangleTopology topology =
+      BuildTriangleTopology(*triangles, points, /*boundaryBandHops=*/2);
+  std::unordered_map<EdgeKey, std::vector<int>, EdgeKeyHash> edgeToTriangles;
+  edgeToTriangles.reserve(triangles->size() * 3);
+  for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
+       ++triIndex) {
+    const auto& ids = (*triangles)[triIndex].pointIds;
+    for (int i = 0; i < 3; ++i) {
+      edgeToTriangles[MakeEdgeKey(ids[i], ids[(i + 1) % 3])].push_back(triIndex);
+    }
+  }
+
+  std::vector<std::vector<int>> sameNeighbors(triangles->size());
+  std::vector<std::map<FacePair, double>> oppositeContact(triangles->size());
+  std::vector<double> sameContact(triangles->size(), 0.0);
+  for (const auto& [edge, incidentTriangles] : edgeToTriangles) {
+    if (incidentTriangles.size() != 2) {
+      continue;
+    }
+    const int a = incidentTriangles[0];
+    const int b = incidentTriangles[1];
+    const FacePair pairA = NormalizePair((*triangles)[a].pair);
+    const FacePair pairB = NormalizePair((*triangles)[b].pair);
+    const double length = Norm(GetPoint(points, edge.a) - GetPoint(points, edge.b));
+    if (pairA == pairB) {
+      sameNeighbors[a].push_back(b);
+      sameNeighbors[b].push_back(a);
+      sameContact[a] += length;
+      sameContact[b] += length;
+    } else {
+      oppositeContact[a][pairB] += length;
+      oppositeContact[b][pairA] += length;
+    }
+  }
+
+  std::vector<char> visited(triangles->size(), 0);
+  int changed = 0;
+  for (int start = 0; start < static_cast<int>(triangles->size()); ++start) {
+    if (visited[start]) {
+      continue;
+    }
+
+    const FacePair label = NormalizePair((*triangles)[start].pair);
+    std::vector<int> component;
+    std::vector<int> stack = {start};
+    visited[start] = 1;
+    bool hasLowConfidenceTriangle = false;
+    while (!stack.empty()) {
+      const int triIndex = stack.back();
+      stack.pop_back();
+      component.push_back(triIndex);
+      hasLowConfidenceTriangle =
+          hasLowConfidenceTriangle || IsLowConfidenceTriangle((*triangles)[triIndex]);
+      if (static_cast<int>(component.size()) > maxComponentTriangles) {
+        continue;
+      }
+      for (const int neighbor : sameNeighbors[triIndex]) {
+        if (!visited[neighbor] &&
+            NormalizePair((*triangles)[neighbor].pair) == label) {
+          visited[neighbor] = 1;
+          stack.push_back(neighbor);
+        }
+      }
+    }
+
+    if (component.empty() ||
+        static_cast<int>(component.size()) > maxComponentTriangles) {
+      continue;
+    }
+    if (!hasLowConfidenceTriangle &&
+        !ComponentIntersectsBoundaryBand(component, topology)) {
+      continue;
+    }
+
+    std::map<FacePair, double> candidateContact;
+    double totalSameContact = 0.0;
+    for (const int triIndex : component) {
+      totalSameContact += sameContact[triIndex];
+      for (const auto& [candidate, length] : oppositeContact[triIndex]) {
+        if (candidate != label && !IsLowConfidencePair(candidate)) {
+          candidateContact[candidate] += length;
+        }
+      }
+    }
+    if (candidateContact.empty()) {
+      continue;
+    }
+
+    const auto best = std::max_element(
+        candidateContact.begin(), candidateContact.end(),
+        [](const auto& a, const auto& b) { return a.second < b.second; });
+    double secondContact = 0.0;
+    for (const auto& [candidate, length] : candidateContact) {
+      if (candidate != best->first) {
+        secondContact = std::max(secondContact, length);
+      }
+    }
+
+    const double requiredRatio =
+        hasLowConfidenceTriangle ? 1.20 : minOppositeContactRatio;
+    const bool clearlyTouchesOneSide =
+        secondContact <= 1e-12 || best->second >= secondContact * 2.0;
+    const bool weaklyConnectedToOwnSide =
+        totalSameContact <= 1e-12 || best->second >= totalSameContact * requiredRatio;
+    if (!clearlyTouchesOneSide || !weaklyConnectedToOwnSide) {
+      continue;
+    }
+
+    for (const int triIndex : component) {
+      (*triangles)[triIndex].pair = best->first;
+      (*triangles)[triIndex].confidence =
+          std::max((*triangles)[triIndex].confidence, 0.70);
+    }
+    changed += static_cast<int>(component.size());
+  }
+
+  return changed;
+}
+
 int OptimizeBoundaryByLoss(std::vector<OutputTriangle>* triangles,
                            vtkPoints* points,
                            double minImprovement = 0.50,
                            int maxSinglePasses = 1,
                            int maxSmallComponentTriangles = 36,
-                           double mergeMinImprovement = 3.00) {
+                           double mergeMinImprovement = 3.00,
+                           bool protectHighConfidence = true) {
   if (!triangles || !points || triangles->empty()) {
     return 0;
   }
@@ -1483,19 +2048,42 @@ int OptimizeBoundaryByLoss(std::vector<OutputTriangle>* triangles,
   BoundaryLoss currentLoss = ComputeBoundaryLoss(*triangles, points);
 
   for (int pass = 0; pass < maxSinglePasses; ++pass) {
+    const TriangleTopology topology =
+        BuildTriangleTopology(*triangles, points, /*boundaryBandHops=*/1);
     int passChanged = 0;
     for (int triIndex = 0; triIndex < static_cast<int>(triangles->size());
          ++triIndex) {
       const FacePair current = NormalizePair((*triangles)[triIndex].pair);
+      const bool lowConfidenceTriangle =
+          IsLowConfidenceTriangle((*triangles)[triIndex]);
+      if (!lowConfidenceTriangle &&
+          triIndex < static_cast<int>(topology.boundaryBand.size()) &&
+          !topology.boundaryBand[triIndex]) {
+        continue;
+      }
+      std::map<FacePair, int> candidateCounts;
       std::set<FacePair> candidates;
       for (const int neighbor : neighbors[triIndex]) {
         const FacePair neighborPair = NormalizePair((*triangles)[neighbor].pair);
         if (neighborPair != current) {
           candidates.insert(neighborPair);
+          ++candidateCounts[neighborPair];
         }
       }
       if (candidates.empty()) {
         continue;
+      }
+      if (protectHighConfidence && !lowConfidenceTriangle) {
+        bool fullySurrounded = false;
+        for (const auto& [candidate, count] : candidateCounts) {
+          if (count >= 3) {
+            fullySurrounded = true;
+            break;
+          }
+        }
+        if (!fullySurrounded) {
+          continue;
+        }
       }
 
       FacePair bestPair = current;
@@ -1503,7 +2091,11 @@ int OptimizeBoundaryByLoss(std::vector<OutputTriangle>* triangles,
       for (const FacePair& candidate : candidates) {
         (*triangles)[triIndex].pair = candidate;
         const BoundaryLoss trialLoss = ComputeBoundaryLoss(*triangles, points);
-        if (trialLoss.total + minImprovement < bestLoss.total) {
+        const double requiredImprovement =
+            (!protectHighConfidence || lowConfidenceTriangle)
+                ? minImprovement
+                : minImprovement * 4.0;
+        if (trialLoss.total + requiredImprovement < bestLoss.total) {
           bestLoss = trialLoss;
           bestPair = candidate;
         }
@@ -1512,6 +2104,8 @@ int OptimizeBoundaryByLoss(std::vector<OutputTriangle>* triangles,
 
       if (bestPair != current) {
         (*triangles)[triIndex].pair = bestPair;
+        (*triangles)[triIndex].confidence =
+            std::max((*triangles)[triIndex].confidence, 0.65);
         currentLoss = bestLoss;
         ++changed;
         ++passChanged;
@@ -1522,8 +2116,11 @@ int OptimizeBoundaryByLoss(std::vector<OutputTriangle>* triangles,
     }
   }
 
-  // 集体投降：小连通片整体并入相邻阵营，只有 loss 有足够改善才接受。
   neighbors = BuildEdgeNeighbors(*triangles);
+  const TriangleTopology componentTopology =
+      BuildTriangleTopology(*triangles, points, /*boundaryBandHops=*/2);
+
+  // 集体投降：小连通片整体并入相邻阵营，只有 loss 有足够改善才接受。
   std::vector<char> visited(triangles->size(), 0);
   for (int start = 0; start < static_cast<int>(triangles->size()); ++start) {
     if (visited[start]) {
@@ -1547,8 +2144,18 @@ int OptimizeBoundaryByLoss(std::vector<OutputTriangle>* triangles,
       }
     }
 
+    bool lowConfidenceComponent = IsLowConfidencePair(label);
+    for (const int triIndex : component) {
+      lowConfidenceComponent =
+          lowConfidenceComponent || IsLowConfidenceTriangle((*triangles)[triIndex]);
+    }
+
     if (component.empty() ||
-        static_cast<int>(component.size()) > maxSmallComponentTriangles) {
+        static_cast<int>(component.size()) > maxSmallComponentTriangles ||
+        (!lowConfidenceComponent &&
+         !ComponentIntersectsBoundaryBand(component, componentTopology)) ||
+        (protectHighConfidence && !lowConfidenceComponent &&
+         static_cast<int>(component.size()) > 3)) {
       continue;
     }
 
@@ -1584,6 +2191,8 @@ int OptimizeBoundaryByLoss(std::vector<OutputTriangle>* triangles,
     if (bestPair != label) {
       for (const int triIndex : component) {
         (*triangles)[triIndex].pair = bestPair;
+        (*triangles)[triIndex].confidence =
+            std::max((*triangles)[triIndex].confidence, 0.65);
       }
       currentLoss = bestLoss;
       changed += static_cast<int>(component.size());
@@ -1631,7 +2240,7 @@ int MergeTinyRegions(std::vector<OutputTriangle>* triangles,
       }
     }
 
-    if (static_cast<int>(component.size()) > maxTinyComponentTriangles &&
+    if (static_cast<int>(component.size()) > maxTinyComponentTriangles ||
         componentArea > maxTinyComponentArea) {
       continue;
     }
@@ -1931,6 +2540,32 @@ bool WritePolyData(vtkPolyData* data, const std::string& path) {
   return writer->Write() == 1;
 }
 
+int CountUnmatchedMidSurfaceTriangles(vtkPolyData* midSurface,
+                                      const VolumeMidpointIndex& volumeIndex) {
+  if (!midSurface) {
+    return 0;
+  }
+
+  int unmatched = 0;
+  for (vtkIdType cellId = 0; cellId < midSurface->GetNumberOfCells(); ++cellId) {
+    vtkCell* cell = midSurface->GetCell(cellId);
+    if (!cell || cell->GetNumberOfPoints() != 3) {
+      continue;
+    }
+
+    std::array<Vec3, 3> midPoints{};
+    for (int i = 0; i < 3; ++i) {
+      midPoints[i] = GetPoint(midSurface, cell->GetPointId(i));
+    }
+
+    TriangleTetMatch match;
+    if (!volumeIndex.FindTriangleMatch(midPoints, &match)) {
+      ++unmatched;
+    }
+  }
+  return unmatched;
+}
+
 }  // namespace
 
 bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
@@ -1981,6 +2616,16 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
     return false;
   }
 
+  const int probeUnmappedTriangles =
+      CountUnmatchedMidSurfaceTriangles(midSurface, volumeIndex);
+  const bool conservativeBoundaryMatching = probeUnmappedTriangles > 50;
+  const double effectiveProjectionThreshold =
+      conservativeBoundaryMatching ? std::max(projectionThreshold, 0.70)
+                                   : projectionThreshold;
+  const double effectiveDihedralWeight =
+      conservativeBoundaryMatching ? std::min(dihedralWeight, 0.35)
+                                   : dihedralWeight;
+
   std::vector<OutputTriangle> outputTriangles;
   std::vector<std::array<vtkIdType, 4>> quads;
   EdgePairMap edgePairMap;
@@ -2008,6 +2653,7 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
 
       TriangleTetMatch match;
       FacePair pair{kUnmatchedFaceId, kUnmatchedFaceId};
+      SurfacePointEvidence secondFaceEvidence;
       if (volumeIndex.FindTriangleMatch(midPoints, &match)) {
         std::array<Vec3, 3> surfaceFacePoints{};
         for (int i = 0; i < 3; ++i) {
@@ -2019,14 +2665,26 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
             surfaceIndex.FindSurfaceTriangleMatch(surfaceFacePoints);
         // 单点侧：判断公共端点落在哪个 Face ID 上；边界点按投影比例筛选。
         const int secondFaceId = surfaceIndex.FindFaceIdForPoint(
-            GetPoint(volume, match.singlePoint), &midPoints, projectionThreshold,
-            &firstFace.normal, dihedralWeight);
+            GetPoint(volume, match.singlePoint), &midPoints,
+            effectiveProjectionThreshold, &firstFace.normal,
+            effectiveDihedralWeight);
         pair = NormalizePair({firstFace.faceId, secondFaceId});
+        secondFaceEvidence = surfaceIndex.FindFaceIdEvidenceForPoint(
+            GetPoint(volume, match.singlePoint), &midPoints,
+            effectiveProjectionThreshold, &firstFace.normal,
+            effectiveDihedralWeight);
+        pair = NormalizePair({firstFace.faceId, secondFaceEvidence.faceId});
       } else {
         ++unmappedTriangles;
       }
 
-      OutputTriangle triangle{pointIds, pair};
+      double confidence = 0.0;
+      if (IsValidPair(pair)) {
+        confidence = IsLowConfidencePair(pair)
+                         ? 0.45
+                         : Clamp(secondFaceEvidence.confidence, 0.45, 1.0);
+      }
+      OutputTriangle triangle{pointIds, pair, confidence};
       outputTriangles.push_back(triangle);
       // 记录三角形边上的 pair，后续四边形拆分时用于继承局部区域 ID。
       AddTriangleEdgesToMap(triangle, &edgePairMap);
@@ -2065,10 +2723,7 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
       const auto split = SplitQuad(quads[quadIndex], edgePairMap, vertexPairMap);
       outputTriangles.push_back(split[0]);
       outputTriangles.push_back(split[1]);
-      AddTriangleEdgesToMap(split[0], &edgePairMap);
-      AddTriangleEdgesToMap(split[1], &edgePairMap);
-      AddTriangleVerticesToMap(split[0], &vertexPairMap);
-      AddTriangleVerticesToMap(split[1], &vertexPairMap);
+      AddQuadBoundaryToMaps(quads[quadIndex], split, &edgePairMap, &vertexPairMap);
       quadDone[quadIndex] = 1;
       --remainingQuads;
       progressed = true;
@@ -2085,16 +2740,53 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
     outputTriangles.push_back(split[1]);
   }
 
+  const int unmatchedPairsBeforePost = CountUnmatchedPairs(outputTriangles);
+  const bool needsTopologyRepair =
+      unmappedTriangles > 50 || unmatchedPairsBeforePost > 50;
+  const int completedPartialTriangles =
+      needsTopologyRepair ? CompletePartialPairs(&outputTriangles) : 0;
+  const bool aggressiveBoundaryCorrection = needsTopologyRepair;
+  const int boundarySideCorrectedTriangles =
+      aggressiveBoundaryCorrection
+          ? CorrectBoundarySideOutliers(&outputTriangles, midSurface->GetPoints())
+          : 0;
   const int smoothedTriangles =
-      SmoothSmallLabelComponents(&outputTriangles, midSurface->GetPoints());
-  const int jaggySmoothedTriangles = SmoothBoundaryJaggies(&outputTriangles);
-  const bool runExpensiveLoss = outputTriangles.size() <= 80000;
+      needsTopologyRepair
+          ? SmoothSmallLabelComponents(&outputTriangles, midSurface->GetPoints())
+          : SmoothSmallLabelComponents(&outputTriangles, midSurface->GetPoints(),
+                                       24, 1.50, false);
+  const int jaggySmoothedTriangles =
+      needsTopologyRepair
+          ? SmoothBoundaryJaggies(&outputTriangles, midSurface->GetPoints())
+          : SmoothBoundaryJaggies(&outputTriangles, midSurface->GetPoints(), 4,
+                                  false);
+  const int localEnergyOptimizedTriangles =
+      OptimizeBoundaryByLocalEnergy(&outputTriangles, midSurface->GetPoints(),
+                                    needsTopologyRepair ? 4 : 3, 2);
+  const int boundarySideCorrectedTrianglesSecond =
+      aggressiveBoundaryCorrection
+          ? CorrectBoundarySideOutliers(&outputTriangles, midSurface->GetPoints(),
+                                        3, 1.80)
+          : 0;
+  const int unmatchedPairsAfterVoting = CountUnmatchedPairs(outputTriangles);
+  const bool runExpensiveLoss =
+      outputTriangles.size() <= 80000 &&
+      (!needsTopologyRepair || unmatchedPairsAfterVoting > 0);
   const int lossOptimizedTriangles =
       runExpensiveLoss
-          ? OptimizeBoundaryByLoss(&outputTriangles, midSurface->GetPoints())
+          ? (needsTopologyRepair
+                 ? OptimizeBoundaryByLoss(&outputTriangles, midSurface->GetPoints())
+                 : OptimizeBoundaryByLoss(&outputTriangles, midSurface->GetPoints(),
+                                          0.50, 1, 36, 3.00, false))
           : 0;
   const int patchSmoothedTriangles = 0;
-  const int tinyMergedTriangles = 0;
+  const int tinyMergedTriangles =
+      needsTopologyRepair && runExpensiveLoss
+          ? MergeTinyRegions(&outputTriangles, midSurface->GetPoints(), 48, 0.06,
+                             0.25)
+          : 0;
+  const int totalBoundarySideCorrectedTriangles =
+      boundarySideCorrectedTriangles + boundarySideCorrectedTrianglesSecond;
 
   vtkNew<vtkPolyData> output;
   vtkNew<vtkPoints> points;
@@ -2154,9 +2846,21 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
     std::cerr << "Relabeled " << smoothedTriangles
               << " small boundary/component triangles by neighborhood voting.\n";
   }
+  if (completedPartialTriangles > 0) {
+    std::cerr << "Completed " << completedPartialTriangles
+              << " partial (-1, face) triangles from neighboring complete pairs.\n";
+  }
+  if (totalBoundarySideCorrectedTriangles > 0) {
+    std::cerr << "Relabeled " << totalBoundarySideCorrectedTriangles
+              << " boundary-side outlier triangles by contact consistency.\n";
+  }
   if (jaggySmoothedTriangles > 0) {
     std::cerr << "Relabeled " << jaggySmoothedTriangles
               << " jaggy boundary triangles by edge-neighborhood voting.\n";
+  }
+  if (localEnergyOptimizedTriangles > 0) {
+    std::cerr << "Relabeled " << localEnergyOptimizedTriangles
+              << " boundary triangles by local energy optimization.\n";
   }
   if (patchSmoothedTriangles > 0) {
     std::cerr << "Relabeled " << patchSmoothedTriangles
@@ -2167,7 +2871,7 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
               << " boundary triangles/components by boundary-loss optimization.\n";
   }
   if (!runExpensiveLoss) {
-    std::cerr << "Skipped expensive boundary-loss optimization for large mesh.\n";
+    std::cerr << "Skipped expensive boundary-loss optimization.\n";
   }
   if (tinyMergedTriangles > 0) {
     std::cerr << "Merged " << tinyMergedTriangles
