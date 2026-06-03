@@ -6,6 +6,7 @@
 #include <vtkDataArray.h>
 #include <vtkDataSet.h>
 #include <vtkDataSetReader.h>
+#include <vtkDoubleArray.h>
 #include <vtkIdList.h>
 #include <vtkIntArray.h>
 #include <vtkMath.h>
@@ -1034,6 +1035,13 @@ double OutputTriangleArea(const OutputTriangle& triangle, vtkPoints* points) {
                       GetPoint(points, triangle.pointIds[2]));
 }
 
+Vec3 OutputTriangleNormal(const OutputTriangle& triangle, vtkPoints* points) {
+  const Vec3 a = GetPoint(points, triangle.pointIds[0]);
+  const Vec3 b = GetPoint(points, triangle.pointIds[1]);
+  const Vec3 c = GetPoint(points, triangle.pointIds[2]);
+  return Normalize(Cross(b - a, c - a));
+}
+
 TriangleTopology BuildTriangleTopology(
     const std::vector<OutputTriangle>& triangles,
     vtkPoints* points,
@@ -1829,6 +1837,115 @@ std::vector<std::vector<int>> BuildEdgeNeighbors(
     neighbors[incidentTriangles[1]].push_back(incidentTriangles[0]);
   }
   return neighbors;
+}
+
+std::vector<int> AssignSurfaceIdsByPairComponents(
+    const std::vector<OutputTriangle>& triangles) {
+  std::vector<int> surfaceIds(triangles.size(), -1);
+  if (triangles.empty()) {
+    return surfaceIds;
+  }
+
+  const auto neighbors = BuildEdgeNeighbors(triangles);
+  int nextSurfaceId = 0;
+  std::vector<int> stack;
+  for (int start = 0; start < static_cast<int>(triangles.size()); ++start) {
+    if (surfaceIds[start] >= 0) {
+      continue;
+    }
+
+    const FacePair label = NormalizePair(triangles[start].pair);
+    surfaceIds[start] = nextSurfaceId;
+    stack.clear();
+    stack.push_back(start);
+    while (!stack.empty()) {
+      const int triIndex = stack.back();
+      stack.pop_back();
+      for (const int neighbor : neighbors[triIndex]) {
+        if (surfaceIds[neighbor] >= 0) {
+          continue;
+        }
+        if (NormalizePair(triangles[neighbor].pair) != label) {
+          continue;
+        }
+        surfaceIds[neighbor] = nextSurfaceId;
+        stack.push_back(neighbor);
+      }
+    }
+    ++nextSurfaceId;
+  }
+
+  return surfaceIds;
+}
+
+std::vector<int> AssignSurfaceIdsByPairNormalComponents(
+    const std::vector<OutputTriangle>& triangles,
+    vtkPoints* points,
+    double maxNeighborAngleDegrees = 45.0) {
+  std::vector<int> surfaceIds(triangles.size(), -1);
+  if (!points || triangles.empty()) {
+    return surfaceIds;
+  }
+
+  std::vector<Vec3> normals(triangles.size());
+  for (int i = 0; i < static_cast<int>(triangles.size()); ++i) {
+    normals[i] = OutputTriangleNormal(triangles[i], points);
+  }
+
+  std::unordered_map<EdgeKey, std::vector<int>, EdgeKeyHash> edgeToTriangles;
+  edgeToTriangles.reserve(triangles.size() * 3);
+  for (int triIndex = 0; triIndex < static_cast<int>(triangles.size());
+       ++triIndex) {
+    const auto& ids = triangles[triIndex].pointIds;
+    for (int i = 0; i < 3; ++i) {
+      edgeToTriangles[MakeEdgeKey(ids[i], ids[(i + 1) % 3])].push_back(triIndex);
+    }
+  }
+
+  const double angle = Clamp(maxNeighborAngleDegrees, 0.0, 90.0);
+  const double minNormalDot = std::cos(angle * vtkMath::Pi() / 180.0);
+  std::vector<std::vector<int>> neighbors(triangles.size());
+  for (const auto& [edge, incidentTriangles] : edgeToTriangles) {
+    if (incidentTriangles.size() != 2) {
+      continue;
+    }
+    const int a = incidentTriangles[0];
+    const int b = incidentTriangles[1];
+    if (NormalizePair(triangles[a].pair) != NormalizePair(triangles[b].pair)) {
+      continue;
+    }
+    if (std::abs(Dot(normals[a], normals[b])) < minNormalDot) {
+      continue;
+    }
+    neighbors[a].push_back(b);
+    neighbors[b].push_back(a);
+  }
+
+  int nextSurfaceId = 0;
+  std::vector<int> stack;
+  for (int start = 0; start < static_cast<int>(triangles.size()); ++start) {
+    if (surfaceIds[start] >= 0) {
+      continue;
+    }
+
+    surfaceIds[start] = nextSurfaceId;
+    stack.clear();
+    stack.push_back(start);
+    while (!stack.empty()) {
+      const int triIndex = stack.back();
+      stack.pop_back();
+      for (const int neighbor : neighbors[triIndex]) {
+        if (surfaceIds[neighbor] >= 0) {
+          continue;
+        }
+        surfaceIds[neighbor] = nextSurfaceId;
+        stack.push_back(neighbor);
+      }
+    }
+    ++nextSurfaceId;
+  }
+
+  return surfaceIds;
 }
 
 int CompletePartialPairs(std::vector<OutputTriangle>* triangles,
@@ -2664,11 +2781,6 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
         const SurfaceFaceMatch firstFace =
             surfaceIndex.FindSurfaceTriangleMatch(surfaceFacePoints);
         // 单点侧：判断公共端点落在哪个 Face ID 上；边界点按投影比例筛选。
-        const int secondFaceId = surfaceIndex.FindFaceIdForPoint(
-            GetPoint(volume, match.singlePoint), &midPoints,
-            effectiveProjectionThreshold, &firstFace.normal,
-            effectiveDihedralWeight);
-        pair = NormalizePair({firstFace.faceId, secondFaceId});
         secondFaceEvidence = surfaceIndex.FindFaceIdEvidenceForPoint(
             GetPoint(volume, match.singlePoint), &midPoints,
             effectiveProjectionThreshold, &firstFace.normal,
@@ -2757,7 +2869,8 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
                                        24, 1.50, false);
   const int jaggySmoothedTriangles =
       needsTopologyRepair
-          ? SmoothBoundaryJaggies(&outputTriangles, midSurface->GetPoints())
+          ? SmoothBoundaryJaggies(&outputTriangles, midSurface->GetPoints(), 6,
+                                  true)
           : SmoothBoundaryJaggies(&outputTriangles, midSurface->GetPoints(), 4,
                                   false);
   const int localEnergyOptimizedTriangles =
@@ -2800,6 +2913,22 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
   surfaceIds->SetName("surface_id");
   surfaceIds->SetNumberOfComponents(1);
 
+  vtkNew<vtkIntArray> pairIds;
+  pairIds->SetName("pair_id");
+  pairIds->SetNumberOfComponents(1);
+
+  vtkNew<vtkIntArray> pairComponentIds;
+  pairComponentIds->SetName("pair_component_id");
+  pairComponentIds->SetNumberOfComponents(1);
+
+  vtkNew<vtkIntArray> normalComponentIds;
+  normalComponentIds->SetName("normal_component_id");
+  normalComponentIds->SetNumberOfComponents(1);
+
+  vtkNew<vtkDoubleArray> confidenceValues;
+  confidenceValues->SetName("confidence");
+  confidenceValues->SetNumberOfComponents(1);
+
   vtkNew<vtkIntArray> faceId0;
   faceId0->SetName("face_id_0");
   faceId0->SetNumberOfComponents(1);
@@ -2809,21 +2938,50 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
   faceId1->SetNumberOfComponents(1);
 
   // 第三步：Face ID pair -> 连续 surface_id。
-  // 例如第一次遇到 (2, 8) 记为 0，第一次遇到 (5, 9) 记为 1。
+  // pair_id 保留同一个编号，便于后续如果引入几何分片时仍可回溯原始关系。
+  const std::vector<int> pairComponentSurfaceIds =
+      AssignSurfaceIdsByPairComponents(outputTriangles);
+  const std::vector<int> normalComponentSurfaceIds =
+      AssignSurfaceIdsByPairNormalComponents(outputTriangles,
+                                             midSurface->GetPoints(), 48.0);
   std::unordered_map<FacePair, int, FacePairHash> pairToSurfaceId;
-  int nextSurfaceId = 0;
+  int nextPairId = 0;
+  const auto ensurePairId = [&](FacePair pair) {
+    pair = NormalizePair(pair);
+    auto [it, inserted] = pairToSurfaceId.emplace(pair, nextPairId);
+    if (inserted) {
+      ++nextPairId;
+    }
+  };
   for (const OutputTriangle& triangle : outputTriangles) {
+    ensurePairId(triangle.pair);
+  }
+  for (int triangleIndex = 0;
+       triangleIndex < static_cast<int>(outputTriangles.size());
+       ++triangleIndex) {
+    const OutputTriangle& triangle = outputTriangles[triangleIndex];
     vtkIdType ids[3] = {triangle.pointIds[0], triangle.pointIds[1],
                         triangle.pointIds[2]};
     polys->InsertNextCell(3, ids);
 
     const FacePair pair = NormalizePair(triangle.pair);
-    auto [it, inserted] = pairToSurfaceId.emplace(pair, nextSurfaceId);
-    if (inserted) {
-      ++nextSurfaceId;
-    }
+    const auto it = pairToSurfaceId.find(pair);
+    const int pairId = it == pairToSurfaceId.end() ? 0 : it->second;
 
-    surfaceIds->InsertNextValue(it->second);
+    const int normalComponentId =
+        triangleIndex < static_cast<int>(normalComponentSurfaceIds.size())
+            ? normalComponentSurfaceIds[triangleIndex]
+            : pairId;
+    const int surfaceId = pairId;
+
+    surfaceIds->InsertNextValue(surfaceId);
+    pairIds->InsertNextValue(pairId);
+    pairComponentIds->InsertNextValue(
+        triangleIndex < static_cast<int>(pairComponentSurfaceIds.size())
+            ? pairComponentSurfaceIds[triangleIndex]
+            : pairId);
+    normalComponentIds->InsertNextValue(normalComponentId);
+    confidenceValues->InsertNextValue(triangle.confidence);
     faceId0->InsertNextValue(pair.first);
     faceId1->InsertNextValue(pair.second);
   }
@@ -2831,6 +2989,10 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
   output->SetPolys(polys);
   output->GetCellData()->AddArray(surfaceIds);
   output->GetCellData()->SetActiveScalars("surface_id");
+  output->GetCellData()->AddArray(pairIds);
+  output->GetCellData()->AddArray(pairComponentIds);
+  output->GetCellData()->AddArray(normalComponentIds);
+  output->GetCellData()->AddArray(confidenceValues);
   output->GetCellData()->AddArray(faceId0);
   output->GetCellData()->AddArray(faceId1);
 
@@ -2840,8 +3002,7 @@ bool MapMidSurfaceIds(const std::string& surfaceMeshPath,
   }
 
   std::cerr << "Wrote " << outputTriangles.size() << " triangles to "
-            << outputPath << ". Surface relation count: " << nextSurfaceId
-            << ".\n";
+            << outputPath << ". Surface relation count: " << nextPairId << ".\n";
   if (smoothedTriangles > 0) {
     std::cerr << "Relabeled " << smoothedTriangles
               << " small boundary/component triangles by neighborhood voting.\n";
@@ -2904,13 +3065,13 @@ int main(int argc, char** argv) {
   }
 
   // 投影面积比例阈值
-  double projectionThreshold = 0.30;
+  double projectionThreshold = 0.70;
   if (argc >= 7) {
     projectionThreshold = std::atof(argv[6]);
   }
 
   // 二面角权重
-  double dihedralWeight = 0.90;
+  double dihedralWeight = 0.35;
   if (argc >= 8) {
     dihedralWeight = std::atof(argv[7]);
   }
